@@ -1,0 +1,4 @@
+// Accept rkhunter file-property changes only for verified package upgrades.
+// "|| true" so a failing check never blocks package installs.
+DPkg::Pre-Invoke { "if [ -x /usr/local/sbin/rkhunter-apt-verify ]; then /usr/local/sbin/rkhunter-apt-verify pre || true; fi"; };
+DPkg::Post-Invoke { "if [ -x /usr/local/sbin/rkhunter-apt-verify ]; then /usr/local/sbin/rkhunter-apt-verify post || true; fi"; };

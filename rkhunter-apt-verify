@@ -1,0 +1,113 @@
+#!/bin/sh
+#
+# Update rkhunter's file-properties baseline after Debian package upgrades,
+# but only for files the upgrade replaced, and only when the system was
+# clean beforehand and dpkg confirms the new files match their packages.
+#
+# Debian's own APT_AUTOGEN instead runs a full "rkhunter --propupd" after
+# every dpkg run, which silently accepts any tampering into the baseline.
+# The idea of gating the update on a pre-transaction check comes from
+# https://github.com/sjinks/yum-plugin-rkhunter
+#
+# Called from apt via DPkg::Pre-Invoke ("pre") and DPkg::Post-Invoke
+# ("post"); see 95rkhunter-apt-verify. Anything it declines to accept is
+# left for rkhunter's normal daily report.
+
+set -u
+# join needs both inputs in the same byte order.
+export LC_ALL=C
+
+STATE_DIR=/run/rkhunter-apt-verify
+STATE=$STATE_DIR/state
+PRECHECK_LOG=$STATE_DIR/precheck.log
+DPKG_LOG=/var/log/dpkg.log
+RKH_DAT=/var/lib/rkhunter/db/rkhunter.dat
+TAG=rkhunter-apt-verify
+
+log() {
+    logger -t "$TAG" -- "$*" 2>/dev/null
+    echo "$TAG: $*" >&2
+}
+
+pre() {
+    mkdir -p "$STATE_DIR"
+    offset=$(stat -c %s "$DPKG_LOG" 2>/dev/null || echo 0)
+
+    # rkhunter exits non-zero on warnings as well as on errors; either way
+    # we can't vouch for the current baseline, so treat both as dirty.
+    if rkhunter --check --sk --nocolors --rwo --enable properties \
+            --logfile "$PRECHECK_LOG" >/dev/null 2>&1; then
+        echo "clean $offset" >"$STATE"
+    else
+        echo "dirty $offset" >"$STATE"
+        log "rkhunter warned before this dpkg run, so its baseline will not be updated (see $PRECHECK_LOG)"
+    fi
+}
+
+# Packages dpkg reported as installed since the pre-check, without arch.
+changed_packages() {
+    tail -c +"$(($1 + 1))" "$DPKG_LOG" \
+        | awk '$3 == "status" && $4 == "installed" { sub(/:.*/, "", $5); print $5 }' \
+        | sort -u
+}
+
+# Paths in rkhunter.dat, as "canonical-path stored-path". Canonicalising
+# matters on merged-/usr systems, where dpkg may list /bin/ls while
+# rkhunter stores /usr/bin/ls. Field 2 counts colons inside the path.
+rkhunter_paths() {
+    awk -F: '$1 == "File" {
+        p = $3
+        for (i = 1; i <= $2; i++) p = p ":" $(3 + i)
+        print p
+    }' "$RKH_DAT" | while IFS= read -r p; do
+        printf '%s %s\n' "$(realpath -m -- "$p")" "$p"
+    done | sort -u
+}
+
+package_paths() {
+    dpkg -L "$1" 2>/dev/null | while IFS= read -r p; do
+        [ -f "$p" ] && realpath -m -- "$p"
+    done
+}
+
+post() {
+    [ -r "$STATE" ] || return 0
+    read -r status offset <"$STATE"
+    rm -f "$STATE"
+    [ "$status" = clean ] || return 0
+
+    pkgs=$(changed_packages "$offset")
+    [ -n "$pkgs" ] || return 0
+
+    verified=$(mktemp) || return 1
+    known=$(mktemp) || return 1
+    trap 'rm -f "$verified" "$known"' EXIT
+    rkhunter_paths >"$known"
+
+    for pkg in $pkgs; do
+        # Ignore conffiles (flag "c"): local edits to them are expected.
+        bad=$(dpkg --verify "$pkg" 2>&1 | grep -v '^.\{9\} c ')
+        if [ -n "$bad" ]; then
+            log "dpkg --verify $pkg failed, so its files will not be accepted: $(echo "$bad" | tr '\n' ' ')"
+            continue
+        fi
+        package_paths "$pkg" >>"$verified"
+    done
+
+    files=$(sort -u "$verified" | join - "$known" | cut -d' ' -f2- | paste -sd,)
+    [ -n "$files" ] || return 0
+
+    if rkhunter --propupd "$files" --nolog >/dev/null; then
+        log "accepted verified package changes for: $files"
+    else
+        log "rkhunter --propupd failed for: $files"
+    fi
+}
+
+command -v rkhunter >/dev/null || exit 0
+
+case "${1:-}" in
+    pre) pre ;;
+    post) post ;;
+    *) echo "usage: $0 pre|post" >&2; exit 2 ;;
+esac
