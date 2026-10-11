@@ -1,8 +1,8 @@
 #!/bin/sh
 #
 # Update rkhunter's file-properties baseline after Debian package upgrades,
-# but only for files the upgrade replaced, and only when the system was
-# clean beforehand and dpkg confirms the new files match their packages.
+# but only when every change rkhunter sees is explained by a package dpkg
+# just installed, and dpkg confirms that package's files are intact.
 #
 # Debian's own APT_AUTOGEN instead runs a full "rkhunter --propupd" after
 # every dpkg run, which silently accepts any tampering into the baseline.
@@ -14,19 +14,30 @@
 # left for rkhunter's normal daily report.
 
 set -u
-# join needs both inputs in the same byte order.
 export LC_ALL=C
 
 STATE_DIR=/run/rkhunter-apt-verify
 STATE=$STATE_DIR/state
 PRECHECK_LOG=$STATE_DIR/precheck.log
+POSTCHECK_LOG=$STATE_DIR/postcheck.log
 DPKG_LOG=/var/log/dpkg.log
-RKH_DAT=/var/lib/rkhunter/db/rkhunter.dat
 TAG=rkhunter-apt-verify
 
 log() {
     logger -t "$TAG" -- "$*" 2>/dev/null
     echo "$TAG: $*" >&2
+}
+
+# The "properties" group (hashes, attributes, scripts, immutable) only
+# runs per-file tests, so every warning it raises names a file.
+check_properties() {
+    rkhunter --check --sk --nocolors --rwo --enable properties \
+        --logfile "$1" >/dev/null 2>&1
+}
+
+# Files rkhunter marked "[ Warning ]" in a check log.
+warned_files() {
+    sed -n 's/^\[[0-9:]*\]  *\(\/[^ ]*\)  *\[ Warning \]$/\1/p' "$1" | sort -u
 }
 
 pre() {
@@ -35,8 +46,7 @@ pre() {
 
     # rkhunter exits non-zero on warnings as well as on errors; either way
     # we can't vouch for the current baseline, so treat both as dirty.
-    if rkhunter --check --sk --nocolors --rwo --enable properties \
-            --logfile "$PRECHECK_LOG" >/dev/null 2>&1; then
+    if check_properties "$PRECHECK_LOG"; then
         echo "clean $offset" >"$STATE"
     else
         echo "dirty $offset" >"$STATE"
@@ -51,19 +61,9 @@ changed_packages() {
         | sort -u
 }
 
-# Paths in rkhunter.dat, as "canonical-path stored-path". Canonicalising
-# matters on merged-/usr systems, where dpkg may list /bin/ls while
-# rkhunter stores /usr/bin/ls. Field 2 counts colons inside the path.
-rkhunter_paths() {
-    awk -F: '$1 == "File" {
-        p = $3
-        for (i = 1; i <= $2; i++) p = p ":" $(3 + i)
-        print p
-    }' "$RKH_DAT" | while IFS= read -r p; do
-        printf '%s %s\n' "$(realpath -m -- "$p")" "$p"
-    done | sort -u
-}
-
+# Canonical paths of a package's files. Canonicalising matters for
+# merged-/usr (/bin/ls is /usr/bin/ls) and for alternatives, where
+# rkhunter watches /usr/bin/awk but dpkg lists /usr/bin/gawk.
 package_paths() {
     dpkg -L "$1" 2>/dev/null | while IFS= read -r p; do
         [ -f "$p" ] && realpath -m -- "$p"
@@ -79,28 +79,43 @@ post() {
     pkgs=$(changed_packages "$offset")
     [ -n "$pkgs" ] || return 0
 
-    verified=$(mktemp) || return 1
-    known=$(mktemp) || return 1
-    trap 'rm -f "$verified" "$known"' EXIT
-    rkhunter_paths >"$known"
+    # The system was clean before dpkg ran, so whatever rkhunter warns
+    # about now changed during this run.
+    check_properties "$POSTCHECK_LOG" && return 0
+    warned=$(warned_files "$POSTCHECK_LOG")
+    if [ -z "$warned" ]; then
+        log "rkhunter failed without naming any file, so its baseline will not be updated (see $POSTCHECK_LOG)"
+        return 0
+    fi
 
+    verified=$(mktemp) || return 1
+    trap 'rm -f "$verified"' EXIT
     for pkg in $pkgs; do
         # Ignore conffiles (flag "c"): local edits to them are expected.
         bad=$(dpkg --verify "$pkg" 2>&1 | grep -v '^.\{9\} c ')
         if [ -n "$bad" ]; then
-            log "dpkg --verify $pkg failed, so its files will not be accepted: $(echo "$bad" | tr '\n' ' ')"
+            log "dpkg --verify $pkg failed: $(echo "$bad" | tr '\n' ' ')"
             continue
         fi
         package_paths "$pkg" >>"$verified"
     done
 
-    files=$(sort -u "$verified" | join - "$known" | cut -d' ' -f2- | paste -sd,)
-    [ -n "$files" ] || return 0
+    unexplained=$(echo "$warned" | while IFS= read -r f; do
+        grep -qxF -- "$(realpath -m -- "$f")" "$verified" || echo "$f"
+    done)
+    if [ -n "$unexplained" ]; then
+        log "changes not explained by verified packages, so rkhunter's baseline will not be updated: $(echo "$unexplained" | paste -sd' ')"
+        return 0
+    fi
 
-    if rkhunter --propupd "$files" --nolog >/dev/null; then
-        log "accepted verified package changes for: $files"
+    # A full update rather than a per-file one: "--propupd <file>" also
+    # adds every new watched file without asking, and a full update is
+    # needed anyway to record files that newly installed packages added.
+    # Everything rkhunter would change has just been accounted for.
+    if rkhunter --propupd --nolog >/dev/null; then
+        log "accepted verified package changes for: $(echo "$warned" | paste -sd' ')"
     else
-        log "rkhunter --propupd failed for: $files"
+        log "rkhunter --propupd failed"
     fi
 }
 

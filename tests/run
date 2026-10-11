@@ -1,9 +1,14 @@
 #!/bin/sh
-# Run the test scenarios in a throwaway Debian 12 container.
-set -eu
+# Run the test scenarios in throwaway Debian 12 containers, once with
+# rkhunter's default config and once with PKGMGR=DPKG.
+set -u
 here=$(cd "$(dirname "$0")" && pwd)
 engine=$(command -v podman || command -v docker)
-exec "$engine" run --rm \
-    -v "$here/..:/hook:ro,Z" \
-    -v "$here:/test:ro,Z" \
-    docker.io/library/debian:12 sh /test/run-in-container.sh
+status=0
+for pkgmgr in "" DPKG; do
+    "$engine" run --rm -e PKGMGR="$pkgmgr" \
+        -v "$here/..:/hook:ro,Z" \
+        -v "$here:/test:ro,Z" \
+        docker.io/library/debian:12 sh /test/run-in-container.sh || status=1
+done
+exit $status

@@ -36,8 +36,19 @@ Around each dpkg run, apt calls `rkhunter-apt-verify`:
 2. **After dpkg** it finds the packages dpkg installed during the run (from
    `/var/log/dpkg.log`) and runs `dpkg --verify` on each. Conffiles are
    ignored, since local edits to them are normal.
-3. For packages that verify cleanly, it runs `rkhunter --propupd` on just
-   the files rkhunter tracks from those packages.
+3. It runs the properties check again. Since the system was clean before,
+   every warning now is a change made during this dpkg run.
+4. If every warned file belongs to a package from step 2 that verified
+   cleanly, it runs `rkhunter --propupd`. Otherwise it changes nothing.
+
+Files are matched after resolving symlinks, so an alternatives switch such
+as `/usr/bin/awk` now pointing at gawk counts as gawk's file. Files from
+newly installed packages are recorded too.
+
+The update is a full `--propupd` on purpose. rkhunter's per-file form,
+`--propupd FILE`, also adds every new watched file that isn't in its
+database yet, without any check, so a file dropped elsewhere during the
+run would slip in.
 
 Anything it refuses is logged to syslog with the tag `rkhunter-apt-verify`
 and left for rkhunter's normal daily report. A failure never blocks apt.
@@ -65,24 +76,31 @@ To uninstall, delete the two files.
 
 ## Limits
 
-- Each apt run gets one extra rkhunter properties check. On a small VPS
-  this took 23 seconds.
+- Each apt run gets one rkhunter properties check, plus a second one when
+  packages were installed. On a small VPS each took about 23 seconds.
 - `dpkg --verify` checks against the MD5 sums in `/var/lib/dpkg/info`.
   An attacker with root could rewrite those too. The check before dpkg
   runs makes this harder, since tampering has to happen during the dpkg
   run itself.
-- New files that rkhunter starts tracking, and files of removed packages,
-  aren't handled. They still show in the daily report.
+- A file changed between the second check and the `--propupd` would be
+  accepted. That window is a few seconds.
+- Files of removed packages aren't handled, so they still show in the
+  daily report.
 
 ## Tests
 
-`tests/run` uses podman or docker to run three scenarios in a Debian 12
-container, by downgrading and upgrading perl:
+`tests/run` uses podman or docker to run these scenarios in Debian 12
+containers, once with rkhunter's default config and once with
+`PKGMGR=DPKG`. It exits non-zero if any fail.
 
-1. A clean upgrade is accepted, and only `/usr/bin/perl` changes in the
-   baseline.
+1. A clean perl upgrade is accepted, and only `/usr/bin/perl` changes in
+   the baseline.
 2. A file tampered with before the upgrade blocks any update.
-3. A file that fails `dpkg --verify` after the upgrade is not accepted.
+3. Installing gawk, which switches the `/usr/bin/awk` alternative, is
+   accepted.
+4. Installing wget, which adds a watched file, is accepted.
+5. A package file that fails `dpkg --verify` is not accepted.
+6. A file dropped outside any package during a dpkg run is not accepted.
 
 ## License
 
